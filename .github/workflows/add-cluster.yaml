@@ -1,0 +1,67 @@
+name: Pipeline to Add Cluster to ArgoCD
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to add (stage or prod)'
+        required: true
+        type: choice
+        options:
+        - stage
+        - prod
+
+jobs:
+  add-cluster:
+    runs-on: infra
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Update kubeconfig file of Target Cluster
+      run: |
+        CLUSTER_NAME="${{ github.event.inputs.environment }}-cluster"
+        echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+        aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
+
+    - name: RBAC and Token creation on Target Cluster
+      run: |
+        kubectl apply -f ./multi-cluster-configurations/target-cluster-rbac.yaml
+        kubectl apply -f ./multi-cluster-configurations/target-cluster-token.yaml       
+
+    - name: Save Token and CA Data to Environment Variables
+      run: |
+          TARGET_TOKEN=$(kubectl get -n kube-system secret/argocd-manager-token -o jsonpath='{.data.token}' | base64 --decode)
+          TARGET_CA_DATA=$(kubectl get -n kube-system secret/argocd-manager-token -o jsonpath='{.data.ca\.crt}')
+          TARGET_CLUSTER_ENDPOINT=$(aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.endpoint" --output text | sed 's~https://~~')
+
+          echo "TARGET_TOKEN=$TARGET_TOKEN" >> $GITHUB_ENV
+          echo "TARGET_CA_DATA=$TARGET_CA_DATA" >> $GITHUB_ENV
+          echo "TARGET_CLUSTER_ENDPOINT=$TARGET_CLUSTER_ENDPOINT" >> $GITHUB_ENV
+
+    - name: Update kubeconfig file to Dev Cluster
+      run: |
+        aws eks update-kubeconfig --name dev-cluster --region us-east-1
+
+    - name: Add Target Cluster to ArgoCD
+      run: |
+
+        cat <<EOF | kubectl apply -n argocd -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: ${{ github.event.inputs.environment }}-cluster-secret
+          labels:
+            argocd.argoproj.io/secret-type: cluster
+        type: Opaque
+        stringData:
+          name: ${{ github.event.inputs.environment }}-cluster
+          server: https://$TARGET_CLUSTER_ENDPOINT
+          config: |
+            {
+              "bearerToken": "$TARGET_TOKEN",
+              "tlsClientConfig": {
+                "serverName": "$TARGET_CLUSTER_ENDPOINT",
+                "caData": "$TARGET_CA_DATA"
+              }
+            }
+        EOF
